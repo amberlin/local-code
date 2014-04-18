@@ -29,11 +29,11 @@ def parse_cmdline_params(arg_list=None):
                         help="COSMIC fusion file",
                         required=False)
 
-    parser.add_argument("-t",
-                        "--ticdb_file",
-                        type=argparse.FileType('r'),
-                        help="TICdb fusion file",
-                        required=False)
+    #parser.add_argument("-t",
+    #                    "--ticdb_file",
+    #                    type=argparse.FileType('r'),
+    #                    help="TICdb fusion file",
+    #                    required=False)
 
     parser.add_argument("-i",
                         "--chitars_file",
@@ -50,6 +50,12 @@ def parse_cmdline_params(arg_list=None):
     parser.add_argument("-p",
                         "--pickled_data",
                         help="Data from a previous run",
+                        required=False)
+
+    parser.add_argument("-t",
+                        "--test_data",
+                        type=argparse.FileType('r'),
+                        help="Test data",
                         required=False)
 
     # Parse options
@@ -226,12 +232,15 @@ def lookup_transcript(transcript, gene_name, ensembl_transcript_details):
     return ncbi_info[:4] + ensembl_info
 
 
-# Parse the Enesmbl gtf annotations for transcript coordinates
+# Parse the Ensembl gtf annotations for transcript coordinates
 def parse_transcript_gtf(transcript_file):
     gene_id = None
     trans_id = None
     transcript_details = defaultdict()
     for transcript in transcript_file:
+        if re.match("#", transcript):
+            continue
+
         fields = transcript.split('\t')
 
         if fields[2] == "transcript":
@@ -285,13 +294,7 @@ def parse_cosmic_basic(cosmic_lines, ensembl_transcript_details):
                         gene_list[gene_pair][fusion_id]["references"]["pubmed"].append(reference)
                         continue
 
-                    # Initialize data structure for new gene pair
-                    #if not gene_pair in gene_list:
-                    #    gene_list[gene_pair] = defaultdict(dict)
-
-                    # Store new fusion information
-                    #if not fusion_id in gene_list[gene_pair]:
-                     #   gene_list[gene_pair][fusion_id] = defaultdict(dict)
+                    # Store fusion information
                     gene_list[gene_pair][fusion_id]["references"]["pubmed"] = [reference]
                     gene_list[gene_pair][fusion_id]["references"]["cosmic_id"] = [cosmic_id]
                     gene_list[gene_pair][fusion_id]["transcript_details"] = []
@@ -312,12 +315,11 @@ def parse_cosmic_basic(cosmic_lines, ensembl_transcript_details):
 
                     #print gene_list[gene_pair][fusion_id]
 
-            # Store COSMIC id for previously seen fusions
+            # Store new COSMIC id for a previously seen fusion
             if not cosmic_id in seen_cosmic_ids:
                 gene_pair = "-".join(get_genes(fusion_id))
                 gene_list[gene_pair][fusion_id]["references"]["cosmic_id"].append(cosmic_id)
                 seen_cosmic_ids[cosmic_id] = 1
-                #print "APPEND" + str(gene_list[gene_pair][fusion_id])
 
     return gene_list
 
@@ -347,29 +349,29 @@ def merge_data(cosmic_data, chitars_data):
     return cosmic_data
 
 
-# Parse GenBank record and return pubmed id
+# Parse GenBank record and returns all pubmed ids
 def parse_pubmed_id(genbank_record):
+    new_ids = []
     for line in genbank_record:
         if re.search("PUBMED", line):
-            return line.split()[1]
-    else:
-        return None
+            new_ids.append(line.split()[1])
+    return new_ids
 
 
 # Query NCBI to get pubmed id from accession number
 def lookup_accession(number):
-    pubmed_id = None
+    pubmed_ids = []
 
     try:
         handle = Entrez.efetch(db="nucleotide", rettype="gb", id=number)
-        pubmed_id = parse_pubmed_id(handle.read().split("\n"))
+        pubmed_ids = parse_pubmed_id(handle.read().split("\n"))
 
     except urllib2.HTTPError:
         print str(number) + " is not valid"
     except IOError:
         print "Problem connecting to NCBI"
 
-    return pubmed_id
+    return pubmed_ids
 
 
 # Check that id listed is a Pubmed id if not look up accession id and swap fields
@@ -381,14 +383,14 @@ def fix_pubmed_ids(ids):
             seq_ids.append(pubmed_id)
             new_pubmed_id = lookup_accession(pubmed_id)
             if new_pubmed_id:
-                pubmed_ids.append(new_pubmed_id)
+                pubmed_ids += new_pubmed_id
         else:
             pubmed_ids.append(pubmed_id)
 
-    return list(set(pubmed_ids)), list(set(seq_ids))
+    return set(list(pubmed_ids)), set(list(seq_ids))
 
 
-# Parse all data exported frm ChiTars
+# Parse all data exported from ChiTars
 def parse_chitars(lines):
     breakpoints = my_dd()  # nested defaultdict
     for line in lines:
@@ -401,15 +403,76 @@ def parse_chitars(lines):
         sequence_ids = fields[2].split("_")
         gene_pair = fields[3]+"-"+fields[4]
 
+        # If a pubmed id looks like an accession number then fix the ids
         if re.search("[A-Z]", pubmed_ids):
             pubmed_ids, new_sequence_ids = fix_pubmed_ids(pubmed_ids)
             sequence_ids += new_sequence_ids
         else:
             pubmed_ids = pubmed_ids.split("_")
 
-        breakpoints[gene_pair][breakpoint]["references"]["pubmed"] = pubmed_ids
+        breakpoints[gene_pair][breakpoint]["references"]["pubmed"] = list(set(pubmed_ids))
         breakpoints[gene_pair][breakpoint]["references"]["sequence"] = list(set(sequence_ids))
         breakpoints[gene_pair][breakpoint]["disease"] = fields[-1]
+
+    return breakpoints
+
+
+# Parse the Cancer breakpoints file downloaded from ChiTars
+def parse_chitars_breakpoint(breakpoints_lines):
+
+    breakpoints = my_dd()  # nested defaultdict
+    breakpoint_entry = None
+
+    for line in breakpoints_lines:
+        lines = line.split('\r')  # Handle conversion from excel tab-del format
+        for split_line in lines[1:]:  # Skip header line
+            fields = split_line.split('\t')
+            # 0 : Pubmed Reference id
+            # 1 : Database providing pubmed id
+            # 2 : GenBank Sequence id
+            # 3 : Database providing sequence id
+            # 4 : Breakpoint
+            # 5 : Gene 1 id
+            # 6 : Gene 2 id
+            # 7 : Diseases
+
+            # Check if line has a new breakpoint
+            if fields[4]:
+
+                breakpoint = fields[4]
+                gene_pair = fields[5]+"-"+fields[6]
+                databases = set()
+                for db in (fields[1], fields[3]):
+                    if db:
+                        databases.add(db)
+
+                breakpoint_entry = breakpoints[gene_pair][breakpoint]
+                breakpoint_entry["references"]["pubmed"] = {fields[0]}
+                breakpoint_entry["references"]["sequence"] = {fields[2]}
+                breakpoint_entry["disease"] = fields[7]
+                breakpoint_entry["databases"] = databases
+
+            # If not add information to current breakpoint
+            else:
+                # Store pubmed id
+                if fields[0]:
+                    pubmed_id = {fields[0]}
+                    sequence_id = None
+
+                    # If a pubmed id looks like an accession number then fix the ids
+                    if re.search("[A-Z]", str(pubmed_id)):
+                        pubmed_id, sequence_id = fix_pubmed_ids(str(pubmed_id.pop()))
+                    if pubmed_id:
+                        breakpoint_entry["references"]["pubmed"] = breakpoint_entry["references"]["pubmed"].union(pubmed_id)
+                    if sequence_id:
+                        breakpoint_entry["references"]["sequence"] = breakpoint_entry["references"]["sequence"].union(sequence_id)
+
+                    breakpoint_entry["databases"].add(fields[1])
+
+                # Store sequence id
+                if fields[2]:
+                    breakpoint_entry["references"]["sequence"].add(fields[2])
+                    breakpoint_entry["databases"].add(fields[3])
 
     return breakpoints
 
@@ -421,6 +484,77 @@ def parse_ticdb(ticdb_lines):
         fields = re.split("\t", line)
         gene_list.append(fields[0] + "-" + fields[1] + ":" + fields[2])
     return gene_list
+
+
+def parse_gene_info(data_lines):
+    genes = []
+    gene_list = []
+    for line in data_lines:
+        if re.search("GENES", line):
+            if gene_list:
+                genes.append(gene_list)
+            gene_list = [line.split('\t')[1]]
+
+        if re.search("ANNOTATION", line):
+            gene_list.append(line.split('\t')[1])
+
+    genes.append(gene_list)
+
+   # for gene in genes:
+   #     print gene
+
+    return genes
+
+
+def lookup_fusion(fusion_info, fusion_database):
+    gene_pair = fusion_info[0]
+    annotations = fusion_info[1:]
+
+    gene_pair = re.sub(":", "-", gene_pair)
+    orig_gene_pair = gene_pair
+
+    if gene_pair in fusion_database:
+        print "%s: Found" % gene_pair
+        for annotation in annotations:
+            print annotation
+        print_gene_pair_entry(fusion_database[gene_pair])
+
+    else:
+        tmp = gene_pair.split("-")
+        gene_pair = tmp[1] + "-" + tmp[0]
+
+        if gene_pair in fusion_database:
+            print "%s: Found as swap" % orig_gene_pair
+            for annotation in annotations:
+                print annotation
+            print_gene_pair_entry(fusion_database[gene_pair])
+        else:
+            print "%s: Not Found" % orig_gene_pair
+
+
+def print_gene_pair_entry(entry):
+    for fusion_id in entry:
+        print "\t" + fusion_id
+        for key in entry[fusion_id]:
+            if key == "references":
+                print "\t\tReferences"
+                for ref_type in entry[fusion_id]["references"]:
+                    print "\t\t\t%s: %s" % (ref_type, ','.join(entry[fusion_id][key][ref_type]))
+                    if ref_type == "pubmed":
+                        print "\t\t\tLink: http://www.ncbi.nlm.nih.gov/pubmed/%s?" % ','.join(entry[fusion_id][key][ref_type])
+                    if ref_type == "sequence":
+                        print "\t\t\tLink: http://www.ncbi.nlm.nih.gov/nuccore/%s?" % ','.join(entry[fusion_id][key][ref_type])
+            elif key == "transcript_details":
+                print "\t\tTranscript Details"
+                for transcript in entry[fusion_id]["transcript_details"]:
+                    print "\t\t\t%s" % str(transcript)
+            elif key == "disease":
+                print "\t\t%s: %s" % (key, entry[fusion_id][key])
+            else:
+                print "\t\t%s: %s" % (key, ','.join(entry[fusion_id][key]))
+
+#http://www.ncbi.nlm.nih.gov/nuccore/<ids>?
+#http://www.ncbi.nlm.nih.gov/pubmed/<ids>?
 
 
 def main(args):
@@ -437,7 +571,6 @@ def main(args):
         cosmic_lines = [f.rstrip() for f in opts.cosmic_file][1:]
         cosmic_gene_fusions = parse_cosmic_basic(cosmic_lines, transcript_coords)
         print "COSMIC processed"
-        #cosmic_counter = Counter(cosmic_gene_pairs)
 
        # for gene_pair in cosmic_gene_fusions:
        #     print gene_pair
@@ -447,14 +580,10 @@ def main(args):
        #             print "\t\t" + str(transcript)
        #         print "\t\t" + str(cosmic_gene_fusions[gene_pair][fusion_id]["pubmed"])
 
-    if opts.ticdb_file:
-        ticdb_lines = [f.rstrip() for f in opts.ticdb_file][1:]
-        ticdb_gene_pairs = parse_ticdb(ticdb_lines)
-        ticdb_counter = Counter(ticdb_gene_pairs)
-
     if opts.chitars_file:
-        chitars_lines = [f.rstrip() for f in opts.chitars_file][1:]
-        chitars_breakpoints = parse_chitars(chitars_lines)
+        chitars_lines = [f.rstrip() for f in opts.chitars_file]
+        chitars_breakpoints = parse_chitars_breakpoint(chitars_lines)
+        #chitars_breakpoints = parse_chitars(chitars_lines)
         print "CHiTars processed"
 
         #for gene_pair in chitars_breakpoints:
@@ -463,7 +592,13 @@ def main(args):
         #        print "\t" + breakpoint
         #        print "\t\t" + str(chitars_breakpoints[gene_pair][breakpoint]["references"]["pubmed"])
         #        print "\t\t" + str(chitars_breakpoints[gene_pair][breakpoint]["references"]["sequence"])
-        #        print "\t\t" + chitars_breakpoints[gene_pair][breakpoint]["disease"]
+        #        print "\t\t" + str(chitars_breakpoints[gene_pair][breakpoint]["disease"])
+        #        print "\t\t" + str(chitars_breakpoints[gene_pair][breakpoint]["databases"])
+
+ #   if opts.ticdb_file:
+ #       ticdb_lines = [f.rstrip() for f in opts.ticdb_file][1:]
+ #       ticdb_gene_pairs = parse_ticdb(ticdb_lines)
+ #       ticdb_counter = Counter(ticdb_gene_pairs)
 
     if opts.cosmic_file and opts.chitars_file:
         merged_data = merge_data(cosmic_gene_fusions, chitars_breakpoints)
@@ -475,32 +610,18 @@ def main(args):
     if opts.pickled_data:
         merged_data = pickle.load(open(opts.pickled_data, "rb"))
 
-    if merged_data:
+    if opts.test_data:
+        test_lines = [f.rstrip() for f in opts.test_data]
+        gene_info = parse_gene_info(test_lines)
+        for fusion_info in gene_info:
+            lookup_fusion(fusion_info, merged_data)
+
+    print_data = True
+    if merged_data and print_data:
         for gene_pair in merged_data:
             print gene_pair
-            for fusion_id in merged_data[gene_pair]:
-                print "\t" + fusion_id
-                for key in merged_data[gene_pair][fusion_id]:
-                    if key == "references":
-                        print "\t\tReferences"
-                        for ref_type in merged_data[gene_pair][fusion_id]["references"]:
-                            print "\t\t\t%s: %s" % (ref_type, str(merged_data[gene_pair][fusion_id][key][ref_type]))
-                    elif key == "transcript_details":
-                        print "\t\tTranscript Details"
-                        for transcript in merged_data[gene_pair][fusion_id]["transcript_details"]:
-                            print "\t\t\t%s" % str(transcript)
-                    else:
-                        print "\t\t%s: %s" % (key, str(merged_data[gene_pair][fusion_id][key]))
+            print_gene_pair_entry(merged_data[gene_pair])
 
-    #ticdb_ONLY = ticdb_counter - cosmic_counter
-
-    #cosmic_ONLY = cosmic_counter - ticdb_counter
-
-    #for gene in ticdb_ONLY:
-    #    print "%s\t%d" % (gene, ticdb_ONLY[gene])
-
-    #for gene in cosmic_ONLY:
-    #    print "%s\t%d" % (gene, cosmic_ONLY[gene])
     return 1
 
 
