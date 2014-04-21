@@ -1,12 +1,19 @@
 #!/usr/bin/env python
 """Compare different fusion DB and lists"""
 
-__author__ = 'aberlin'
+__author__ = "Aaron Berlin"
+__copyright__ = "Copyright 2014, Enzymatics"
+__credits__ = ["Aaron Berlin"]
+__license__ = "GPL"
+__version__ = "0.1"
+__maintainer__ = "Aaron Berlin"
+__email__ = "aberlin@enzymatics.com"
+__status__ = "Development"
 
 import argparse
 import re
 import sys
-from collections import Counter, defaultdict
+from collections import defaultdict
 from Bio import Entrez
 import urllib2
 import pickle
@@ -14,6 +21,7 @@ import pickle
 Entrez.email = "aberlin@enzymatics.com"
 
 
+# Parse command line arguments
 def parse_cmdline_params(arg_list=None):
     """Parses commandline arguments.
     """
@@ -64,6 +72,7 @@ def parse_cmdline_params(arg_list=None):
     return opts
 
 
+# Allows for automatically nested defaultdicts
 def my_dd():
     return defaultdict(my_dd)
 
@@ -71,12 +80,17 @@ def my_dd():
 # Parse the COSMIC fusion from hgvs format
 def __parse_fusion(fusion, return_type="All"):
 
+    # Super complicated regex to deal with the hgvs format
     regex = re.compile("(?P<gene_names>[a-zA-Z0-9]+)\{(?P<transcripts>\w+\.?\d?)\}:r.(?P<coords>.*?)(?=_[A-Z]|$)")
 
     parsed_results = defaultdict(list)
     for result in regex.finditer(fusion):
-        parsed_results["pairs"].append([result.group("gene_names"), result.group("transcripts")])
-        parsed_results["full_data"].append([result.group("gene_names"), result.group("transcripts"), result.group("coords")])
+        parsed_results["pairs"].append([result.group("gene_names"),
+                                        result.group("transcripts")])
+
+        parsed_results["full_data"].append([result.group("gene_names"),
+                                            result.group("transcripts"),
+                                            result.group("coords")])
         for group in result.groupdict():
             parsed_results[group].append(result.group(group))
 
@@ -95,18 +109,23 @@ def __parse_fusion(fusion, return_type="All"):
         return None
 
 
+# Return the all information available from the COSMIC fusion id
 def get_all_from_fusion(fusion):
+    # Returns a list of [gene_name, transcript, coordinates in gene] for each transcript in the fusion
     return __parse_fusion(fusion, "All")
 
 
+# Return the transcripts from the COSMIC fusion id
 def get_transcripts(fusion):
     return __parse_fusion(fusion, "transcripts")
 
 
+# Return the gene name and transcript pairs from the COSMIC fusion id
 def get_gene_transcript_pairs(fusion):
     return __parse_fusion(fusion, "pairs")
 
 
+# Return the gene names from the COSMIC fusion id
 def get_genes(fusion):
     return __parse_fusion(fusion, "genes")
 
@@ -237,30 +256,42 @@ def parse_transcript_gtf(transcript_file):
     gene_id = None
     trans_id = None
     transcript_details = defaultdict()
-    for transcript in transcript_file:
-        if re.match("#", transcript):
+    for line in transcript_file:
+        if re.match("#", line):
             continue
 
-        fields = transcript.split('\t')
+        fields = line.split('\t')
+        running_total = 0
+        chromosome = fields[0]
+        start_coord = fields[3]
+        end_coord = fields[4]
+        strand = fields[6]
+        comments = fields[8].split(';')
 
         if fields[2] == "transcript":
-            chromosome = fields[0]
-            start_coord = fields[3]
-            end_coord = fields[4]
-            strand = fields[6]
-            comments = fields[8].split(';')
+
             for entry in comments:
                 if re.search("gene_id", entry):
                     name, gene_id = re.sub("\"", "", entry).split()
                 if re.search("transcript_id", entry):
                     name, trans_id = re.sub("\"", "", entry).split()
-            transcript_details[trans_id] = [gene_id, chromosome, start_coord, end_coord, strand]
-                    #print "%s\t%s\t%s\t%s\t%s" % (trans_id, chromosome, start_coord, end_coord, strand)
+            transcript_details[trans_id]["details"] = [gene_id, chromosome, start_coord, end_coord, strand]
+            running_total = 0
+
+        if fields[2] == "exon":
+
+            for entry in comments:
+                if re.search("transcript_id", entry):
+                    name, trans_id = re.sub("\"", "", entry).split()
+
+            running_total += end_coord - start_coord + 1
+
+            transcript_details[trans_id]["exons"].append(running_total)
 
     return transcript_details
 
 
-#Parse genes and PubMed reference from modified CompleteExport file
+#Parse genes and PubMed reference from CosmicFusionExport_vXX.tsv file
 def parse_cosmic_basic(cosmic_lines, ensembl_transcript_details):
     gene_list = my_dd()  # nested defaultdict
     transcript_details = {}
@@ -273,6 +304,7 @@ def parse_cosmic_basic(cosmic_lines, ensembl_transcript_details):
         if len(fields) >= 8:
             cosmic_id = fields[7]
             fusion_id = fields[8]
+
             # Store the Pubmed reference id if present
             if len(fields) >= 12:
                 reference = fields[12]
@@ -298,6 +330,8 @@ def parse_cosmic_basic(cosmic_lines, ensembl_transcript_details):
                     gene_list[gene_pair][fusion_id]["references"]["pubmed"] = [reference]
                     gene_list[gene_pair][fusion_id]["references"]["cosmic_id"] = [cosmic_id]
                     gene_list[gene_pair][fusion_id]["transcript_details"] = []
+                    gene_list[gene_pair][fusion_id]["sample_count"] = 1
+
                     seen_cosmic_ids[cosmic_id] = 1
 
                     # Store information for each transcript in the fusion
@@ -314,6 +348,9 @@ def parse_cosmic_basic(cosmic_lines, ensembl_transcript_details):
                         gene_list[gene_pair][fusion_id]["transcript_details"].append(transcript_details[transcript])
 
                     #print gene_list[gene_pair][fusion_id]
+            else:
+
+                gene_list["-".join(get_genes(fusion_id))][fusion_id]["sample_count"] += 1
 
             # Store new COSMIC id for a previously seen fusion
             if not cosmic_id in seen_cosmic_ids:
@@ -452,7 +489,7 @@ def parse_chitars_breakpoint(breakpoints_lines):
                 breakpoint_entry["disease"] = fields[7]
                 breakpoint_entry["databases"] = databases
 
-            # If not add information to current breakpoint
+            # If not - add information to current breakpoint
             else:
                 # Store pubmed id
                 if fields[0]:
@@ -477,7 +514,7 @@ def parse_chitars_breakpoint(breakpoints_lines):
     return breakpoints
 
 
-#Parse genes and Pubmed reference from exported data from TICdb
+# Parse genes and Pubmed reference from exported data from TICdb
 def parse_ticdb(ticdb_lines):
     gene_list = []
     for line in ticdb_lines:
@@ -533,28 +570,48 @@ def lookup_fusion(fusion_info, fusion_database):
 
 
 def print_gene_pair_entry(entry):
+    ref_list = None
     for fusion_id in entry:
         print "\t" + fusion_id
         for key in entry[fusion_id]:
             if key == "references":
                 print "\t\tReferences"
                 for ref_type in entry[fusion_id]["references"]:
-                    print "\t\t\t%s: %s" % (ref_type, ','.join(entry[fusion_id][key][ref_type]))
+
+                    ref_list = ','.join(entry[fusion_id][key][ref_type])
+                    print "\t\t\t%s: %s" % (ref_type, ref_list)
                     if ref_type == "pubmed":
-                        print "\t\t\tLink: http://www.ncbi.nlm.nih.gov/pubmed/%s?" % ','.join(entry[fusion_id][key][ref_type])
+                        print "\t\t\tLink: http://www.ncbi.nlm.nih.gov/pubmed/%s?" % ref_list
                     if ref_type == "sequence":
-                        print "\t\t\tLink: http://www.ncbi.nlm.nih.gov/nuccore/%s?" % ','.join(entry[fusion_id][key][ref_type])
+                        print "\t\t\tLink: http://www.ncbi.nlm.nih.gov/nuccore/%s?" % ref_list
+                    if ref_type == "cosmic_id":
+                        for cosmic_id in entry[fusion_id][key][ref_type]:
+                            print "\t\t\tLink: http://cancer.sanger.ac.uk/cosmic/fusion/summary?id=%s" % cosmic_id
+                    if ref_type == "cosmic_gene_ids":
+                        print "\t\t\tLink: http://cancer.sanger.ac.uk/cosmic/fusion/overview?fid=%s&gid=%s" % \
+                              (entry[fusion_id][key][ref_type][0], entry[fusion_id][key][ref_type][1])
+
             elif key == "transcript_details":
                 print "\t\tTranscript Details"
                 for transcript in entry[fusion_id]["transcript_details"]:
                     print "\t\t\t%s" % str(transcript)
-            elif key == "disease":
-                print "\t\t%s: %s" % (key, entry[fusion_id][key])
-            else:
+            elif key == "databases":
                 print "\t\t%s: %s" % (key, ','.join(entry[fusion_id][key]))
 
+            else:
+                print "\t\t%s: %s" % (key, entry[fusion_id][key])
+
+# Link to NCBI queries
 #http://www.ncbi.nlm.nih.gov/nuccore/<ids>?
 #http://www.ncbi.nlm.nih.gov/pubmed/<ids>?
+
+# Link to exact fusion
+#http://cancer.sanger.ac.uk/cosmic/fusion/summary?id=
+# Link to all fusion btw gene pair
+#http://cancer.sanger.ac.uk/cosmic/fusion/overview?fid=<gene1id>&gid=<gene2_id>
+
+# Link to all breakpoints btw gene pair
+#http://chitars.bioinfo.cnio.es/cgi-bin/breakpoints.pl?refdis=3&searchstr=<gene1_name>%20%26%20<gene2_name>
 
 
 def main(args):
