@@ -237,7 +237,12 @@ def lookup_transcript(transcript, gene_name, ensembl_transcript_details):
         print "Trying to lookup by gene name"
         ncbi_info = lookup_by_gene(gene_name)
 
-    ensembl_info = ensembl_transcript_details.get(transcript)
+    ensembl_info = None
+
+    if transcript in ensembl_transcript_details:
+        ensembl_info = ensembl_transcript_details[transcript]["details"]
+
+
 
     if not ncbi_info and not ensembl_info:
         return None
@@ -255,13 +260,14 @@ def lookup_transcript(transcript, gene_name, ensembl_transcript_details):
 def parse_transcript_gtf(transcript_file):
     gene_id = None
     trans_id = None
-    transcript_details = defaultdict()
+    transcript_details = {}
+    running_total = 0
+
     for line in transcript_file:
         if re.match("#", line):
             continue
 
         fields = line.split('\t')
-        running_total = 0
         chromosome = fields[0]
         start_coord = fields[3]
         end_coord = fields[4]
@@ -275,6 +281,9 @@ def parse_transcript_gtf(transcript_file):
                     name, gene_id = re.sub("\"", "", entry).split()
                 if re.search("transcript_id", entry):
                     name, trans_id = re.sub("\"", "", entry).split()
+            #transcript_details[trans_id] = [gene_id, chromosome, start_coord, end_coord, strand]
+            transcript_details[trans_id] = {}
+            transcript_details[trans_id]["exons"] = []
             transcript_details[trans_id]["details"] = [gene_id, chromosome, start_coord, end_coord, strand]
             running_total = 0
 
@@ -284,9 +293,16 @@ def parse_transcript_gtf(transcript_file):
                 if re.search("transcript_id", entry):
                     name, trans_id = re.sub("\"", "", entry).split()
 
-            running_total += end_coord - start_coord + 1
+            running_total += int(end_coord) - int(start_coord) + 1
 
             transcript_details[trans_id]["exons"].append(running_total)
+
+
+
+    #for tran_id in transcript_details:
+    #    print tran_id
+    print "\t" + str(transcript_details["ENST00000392069"]["details"])
+    print "\t" + str(transcript_details["ENST00000392069"]["exons"])
 
     return transcript_details
 
@@ -330,6 +346,7 @@ def parse_cosmic_basic(cosmic_lines, ensembl_transcript_details):
                     gene_list[gene_pair][fusion_id]["references"]["pubmed"] = [reference]
                     gene_list[gene_pair][fusion_id]["references"]["cosmic_id"] = [cosmic_id]
                     gene_list[gene_pair][fusion_id]["transcript_details"] = []
+                    gene_list[gene_pair][fusion_id]["exon_details"] = []
                     gene_list[gene_pair][fusion_id]["sample_count"] = 1
 
                     seen_cosmic_ids[cosmic_id] = 1
@@ -342,10 +359,13 @@ def parse_cosmic_basic(cosmic_lines, ensembl_transcript_details):
                             details = lookup_transcript(transcript, gene_name, ensembl_transcript_details)
 
                             # Save the transcript details so we don't have to query NCBI again
-                            transcript_details[transcript] = details
+                            transcript_details[transcript] = {}
+                            transcript_details[transcript]["details"] = details
+                            transcript_details[transcript]["exons"] = []
 
                         #print "\t" + transcript + ": " + str(transcript_details[transcript])
-                        gene_list[gene_pair][fusion_id]["transcript_details"].append(transcript_details[transcript])
+                        gene_list[gene_pair][fusion_id]["transcript_details"].append(transcript_details[transcript]["details"])
+                        gene_list[gene_pair][fusion_id]["exon_details"].append(transcript_details[transcript]["exons"])
 
                     #print gene_list[gene_pair][fusion_id]
             else:
@@ -624,6 +644,7 @@ def main(args):
 
         if opts.ensembl_file:
             transcript_coords = parse_transcript_gtf(opts.ensembl_file)
+            print "Loaded GTF file"
 
         cosmic_lines = [f.rstrip() for f in opts.cosmic_file][1:]
         cosmic_gene_fusions = parse_cosmic_basic(cosmic_lines, transcript_coords)

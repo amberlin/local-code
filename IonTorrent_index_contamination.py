@@ -1,5 +1,14 @@
 #!/usr/bin/env python
-__author__ = 'aberlin'
+"""Evaluate Ion Torrent barcode contamination """
+
+__author__ = "Aaron Berlin"
+__copyright__ = "Copyright 2014, Enzymatics"
+__credits__ = ["Aaron Berlin"]
+__license__ = "GPL"
+__version__ = "0.1"
+__maintainer__ = "Aaron Berlin"
+__email__ = "aberlin@enzymatics.com"
+__status__ = "Development"
 
 import argparse
 import re
