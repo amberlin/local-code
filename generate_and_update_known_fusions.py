@@ -17,6 +17,7 @@ from collections import defaultdict
 from Bio import Entrez
 import urllib2
 import pickle
+import sqlite3 as lite
 
 Entrez.email = "aberlin@enzymatics.com"
 
@@ -37,12 +38,6 @@ def parse_cmdline_params(arg_list=None):
                         help="COSMIC fusion file",
                         required=False)
 
-    #parser.add_argument("-t",
-    #                    "--ticdb_file",
-    #                    type=argparse.FileType('r'),
-    #                    help="TICdb fusion file",
-    #                    required=False)
-
     parser.add_argument("-i",
                         "--chitars_file",
                         type=argparse.FileType('r'),
@@ -52,7 +47,7 @@ def parse_cmdline_params(arg_list=None):
     parser.add_argument("-e",
                         "--ensembl_file",
                         type=argparse.FileType('r'),
-                        help="Ensembl transcripts file",
+                        help="Ensembl transcripts gtf file",
                         required=False)
 
     parser.add_argument("-p",
@@ -81,7 +76,7 @@ def my_dd():
 def __parse_fusion(fusion, return_type="All"):
 
     # Super complicated regex to deal with the hgvs format
-    regex = re.compile("(?P<gene_names>[a-zA-Z0-9]+)\{(?P<transcripts>\w+\.?\d?)\}:r.(?P<coords>.*?)(?=_[A-Z]|$)")
+    regex = re.compile("(?P<gene_names>[a-zA-Z0-9]+)\{(?P<transcripts>\w+\.?\d?)\}:r.(?P<coords>.*?)(?=_[A-Z]|_o|$)")
 
     parsed_results = defaultdict(list)
     for result in regex.finditer(fusion):
@@ -145,6 +140,91 @@ def parse_cosmic(cosmic_lines):
                 seen_list[fusion] = 1
 
     return gene_list
+
+
+def get_exons_involved(fusion_coordinates, exon_coordinates):
+
+    if not len(fusion_coordinates) == len(exon_coordinates):
+        print "WARN: Fusion and Exons coordinates are different lengths ... something is crossed up"
+
+    exon_list = []
+
+    #print fusion_coordinates
+    #print exon_coordinates
+
+    for i, transcript_coords in enumerate(fusion_coordinates):
+        breakpoint_edge_coords = []
+        comments = ""
+
+        if transcript_coords == "?":
+            exon_list.append("Unknown")
+            continue
+
+        if re.search("\(", transcript_coords):
+            exon_list.append("Unknown")
+            print "Weird coord w/ (): " + transcript_coords
+            print fusion_coordinates
+            continue
+
+        # Parse the fusion coordinates into breakpoints that need to be looked up
+        coords = transcript_coords.split("_")
+
+        if len(coords) == 3:
+            comments = coords[2]
+            if not re.search("ins|del", coords[2]):
+                print "Weird coord: " + transcript_coords
+                print fusion_coordinates
+
+        if i == 0:
+            breakpoint_edge_coords.append(coords[1])
+        elif i == len(fusion_coordinates) - 1:
+            breakpoint_edge_coords.append(coords[0])
+        else:
+            breakpoint_edge_coords.append(coords[0])
+            breakpoint_edge_coords.append(coords[1])
+
+        # Lookup each edge from the corresponding list of exon coordinates
+        for breakpoint_edge in breakpoint_edge_coords:
+            #print "Coord: " + str(breakpoint_edge)
+
+            # If the edge coordinate has a + or - then the break point is actually X bases in to the intron
+            if re.search("\+", breakpoint_edge):
+                breakpoint_edge, bp_into_intron = breakpoint_edge.split("+")
+                comments += "(intron +%sbp)" % bp_into_intron
+
+            if re.search("\-", breakpoint_edge):
+                breakpoint_edge, bp_into_intron = breakpoint_edge.split("-")
+                comments += "(intron -%sbp)" % bp_into_intron
+
+            # If breakpoint edge coordinate has some weird text lets grab it and skip it for now
+            try:
+                int(breakpoint_edge)
+            except ValueError:
+                print "Weird breakpoint: " + breakpoint_edge
+                exon_list.append("Unknown")
+                continue
+
+            exon_coords = exon_coordinates[i]
+            # If we don't have an exon coordinate list for the transcript
+            if not exon_coords:
+                exon_list.append("Unknown")
+                continue
+
+            for j in range(len(exon_coords) - 1):
+                if int(breakpoint_edge) > int(exon_coords[len(exon_coords) - 1]) and re.search("ins", comments):
+                    exon_list.append(str(len(exon_coords)-1) + comments)
+                    break
+
+                if int(breakpoint_edge) > int(exon_coords[len(exon_coords) - 1]):
+                    exon_list.append(">"+str(len(exon_coords)-1))
+                    break
+
+                if int(exon_coords[j]) < int(breakpoint_edge) <= int(exon_coords[j+1]):
+                    exon_list.append(str(j+1) + comments)
+                    #print "Exon : " + str(j+1)
+                    break
+
+    return exon_list
 
 
 # Parse the gene record returned by Entrez
@@ -238,22 +318,22 @@ def lookup_transcript(transcript, gene_name, ensembl_transcript_details):
         ncbi_info = lookup_by_gene(gene_name)
 
     ensembl_info = None
+    exon_info = []
 
     if transcript in ensembl_transcript_details:
         ensembl_info = ensembl_transcript_details[transcript]["details"]
-
-
+        exon_info = ensembl_transcript_details[transcript]["exons"]
 
     if not ncbi_info and not ensembl_info:
-        return None
+        return None, None
 
     if not ensembl_info:
-        return ncbi_info
+        return ncbi_info, None
 
     if not ncbi_info:
         ncbi_info = ["", "", "", ""]
 
-    return ncbi_info[:4] + ensembl_info
+    return ncbi_info[:4] + ensembl_info, exon_info
 
 
 # Parse the Ensembl gtf annotations for transcript coordinates
@@ -283,7 +363,7 @@ def parse_transcript_gtf(transcript_file):
                     name, trans_id = re.sub("\"", "", entry).split()
             #transcript_details[trans_id] = [gene_id, chromosome, start_coord, end_coord, strand]
             transcript_details[trans_id] = {}
-            transcript_details[trans_id]["exons"] = []
+            transcript_details[trans_id]["exons"] = [0]
             transcript_details[trans_id]["details"] = [gene_id, chromosome, start_coord, end_coord, strand]
             running_total = 0
 
@@ -295,14 +375,8 @@ def parse_transcript_gtf(transcript_file):
 
             running_total += int(end_coord) - int(start_coord) + 1
 
+            # Store the coordinate of the the exon end on the transcript
             transcript_details[trans_id]["exons"].append(running_total)
-
-
-
-    #for tran_id in transcript_details:
-    #    print tran_id
-    print "\t" + str(transcript_details["ENST00000392069"]["details"])
-    print "\t" + str(transcript_details["ENST00000392069"]["exons"])
 
     return transcript_details
 
@@ -335,7 +409,7 @@ def parse_cosmic_basic(cosmic_lines, ensembl_transcript_details):
 
                 if fusion_details:
                     #print "\n" + fusion_id + " : " + reference
-                    gene_pair = "-".join(fusion_details['gene_names'])
+                    gene_pair = ":".join(fusion_details['gene_names'])
 
                     #Just pubmed id if we have already seen an identical fusion
                     if gene_pair in gene_list and fusion_id in gene_list[gene_pair]:
@@ -347,6 +421,7 @@ def parse_cosmic_basic(cosmic_lines, ensembl_transcript_details):
                     gene_list[gene_pair][fusion_id]["references"]["cosmic_id"] = [cosmic_id]
                     gene_list[gene_pair][fusion_id]["transcript_details"] = []
                     gene_list[gene_pair][fusion_id]["exon_details"] = []
+                    gene_list[gene_pair][fusion_id]["exons-involved"] = []
                     gene_list[gene_pair][fusion_id]["sample_count"] = 1
 
                     seen_cosmic_ids[cosmic_id] = 1
@@ -356,25 +431,28 @@ def parse_cosmic_basic(cosmic_lines, ensembl_transcript_details):
                         if not transcript in transcript_details:
 
                             # Query NCBI for transcripts details
-                            details = lookup_transcript(transcript, gene_name, ensembl_transcript_details)
+                            details, exon_details = lookup_transcript(transcript, gene_name, ensembl_transcript_details)
 
                             # Save the transcript details so we don't have to query NCBI again
                             transcript_details[transcript] = {}
                             transcript_details[transcript]["details"] = details
-                            transcript_details[transcript]["exons"] = []
+                            transcript_details[transcript]["exons"] = exon_details
 
                         #print "\t" + transcript + ": " + str(transcript_details[transcript])
                         gene_list[gene_pair][fusion_id]["transcript_details"].append(transcript_details[transcript]["details"])
                         gene_list[gene_pair][fusion_id]["exon_details"].append(transcript_details[transcript]["exons"])
 
+                    gene_list[gene_pair][fusion_id]["exons-involved"] = \
+                        get_exons_involved(fusion_details['coords'], gene_list[gene_pair][fusion_id]["exon_details"])
+
                     #print gene_list[gene_pair][fusion_id]
             else:
 
-                gene_list["-".join(get_genes(fusion_id))][fusion_id]["sample_count"] += 1
+                gene_list[":".join(get_genes(fusion_id))][fusion_id]["sample_count"] += 1
 
             # Store new COSMIC id for a previously seen fusion
             if not cosmic_id in seen_cosmic_ids:
-                gene_pair = "-".join(get_genes(fusion_id))
+                gene_pair = ":".join(get_genes(fusion_id))
                 gene_list[gene_pair][fusion_id]["references"]["cosmic_id"].append(cosmic_id)
                 seen_cosmic_ids[cosmic_id] = 1
 
@@ -497,7 +575,7 @@ def parse_chitars_breakpoint(breakpoints_lines):
             if fields[4]:
 
                 breakpoint = fields[4]
-                gene_pair = fields[5]+"-"+fields[6]
+                gene_pair = fields[5]+":"+fields[6]
                 databases = set()
                 for db in (fields[1], fields[3]):
                     if db:
@@ -534,15 +612,6 @@ def parse_chitars_breakpoint(breakpoints_lines):
     return breakpoints
 
 
-# Parse genes and Pubmed reference from exported data from TICdb
-def parse_ticdb(ticdb_lines):
-    gene_list = []
-    for line in ticdb_lines:
-        fields = re.split("\t", line)
-        gene_list.append(fields[0] + "-" + fields[1] + ":" + fields[2])
-    return gene_list
-
-
 def parse_gene_info(data_lines):
     genes = []
     gene_list = []
@@ -567,7 +636,6 @@ def lookup_fusion(fusion_info, fusion_database):
     gene_pair = fusion_info[0]
     annotations = fusion_info[1:]
 
-    gene_pair = re.sub(":", "-", gene_pair)
     orig_gene_pair = gene_pair
 
     if gene_pair in fusion_database:
@@ -577,8 +645,8 @@ def lookup_fusion(fusion_info, fusion_database):
         print_gene_pair_entry(fusion_database[gene_pair])
 
     else:
-        tmp = gene_pair.split("-")
-        gene_pair = tmp[1] + "-" + tmp[0]
+        tmp = gene_pair.split(":")
+        gene_pair = tmp[1] + ":" + tmp[0]
 
         if gene_pair in fusion_database:
             print "%s: Found as swap" % orig_gene_pair
@@ -673,11 +741,6 @@ def main(args):
         #        print "\t\t" + str(chitars_breakpoints[gene_pair][breakpoint]["disease"])
         #        print "\t\t" + str(chitars_breakpoints[gene_pair][breakpoint]["databases"])
 
- #   if opts.ticdb_file:
- #       ticdb_lines = [f.rstrip() for f in opts.ticdb_file][1:]
- #       ticdb_gene_pairs = parse_ticdb(ticdb_lines)
- #       ticdb_counter = Counter(ticdb_gene_pairs)
-
     if opts.cosmic_file and opts.chitars_file:
         merged_data = merge_data(cosmic_gene_fusions, chitars_breakpoints)
         print "Merged"
@@ -694,7 +757,7 @@ def main(args):
         for fusion_info in gene_info:
             lookup_fusion(fusion_info, merged_data)
 
-    print_data = True
+    print_data = False
     if merged_data and print_data:
         for gene_pair in merged_data:
             print gene_pair
