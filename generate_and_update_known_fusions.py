@@ -13,6 +13,7 @@ __status__ = "Development"
 import argparse
 import re
 import sys
+import os
 from collections import defaultdict
 from Bio import Entrez
 import urllib2
@@ -36,6 +37,11 @@ def parse_cmdline_params(arg_list=None):
                         "--cosmic_file",
                         type=argparse.FileType('r'),
                         help="COSMIC fusion file",
+                        required=False)
+
+    parser.add_argument("-d",
+                        "--database_name",
+                        help="Database Name",
                         required=False)
 
     parser.add_argument("-i",
@@ -553,13 +559,26 @@ def parse_chitars(lines):
 
 
 # Parse the Cancer breakpoints file downloaded from ChiTars
-def parse_chitars_breakpoint(breakpoints_lines):
+def parse_chitars_breakpoint(breakpoints_lines, database):
 
     breakpoints = my_dd()  # nested defaultdict
     breakpoint_entry = None
+    breakpoint = None
+
+    conn = lite.connect(database)
+
+    conn.row_factory = lite.Row
+    cur = conn.cursor()
+    cur.execute("SELECT NAME, RESOURCE_ID FROM Resources")
+
+    resource_id_lookup = {}
+    for row in cur.fetchall():
+        resource_id_lookup[row['NAME']] = row['RESOURCE_ID']
+
 
     for line in breakpoints_lines:
         lines = line.split('\r')  # Handle conversion from excel tab-del format
+
         for split_line in lines[1:]:  # Skip header line
             fields = split_line.split('\t')
             # 0 : Pubmed Reference id
@@ -580,6 +599,16 @@ def parse_chitars_breakpoint(breakpoints_lines):
                 for db in (fields[1], fields[3]):
                     if db:
                         databases.add(db)
+                        conn.execute('INSERT INTO Evidence VALUES (?,?,NULL,NULL)',
+                                    (resource_id_lookup[db], str(breakpoint)))
+
+                conn.execute('INSERT INTO Known_Fusions VALUES (?,?,?)', (breakpoint, gene_pair, fields[7]))
+                if fields[0]:
+                    conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
+                                (resource_id_lookup["PubMed"], str(breakpoint), str(fields[0])))
+                if fields[2]:
+                    conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
+                                (resource_id_lookup["GenBank"], str(breakpoint), str(fields[2])))
 
                 breakpoint_entry = breakpoints[gene_pair][breakpoint]
                 breakpoint_entry["references"]["pubmed"] = {fields[0]}
@@ -591,24 +620,54 @@ def parse_chitars_breakpoint(breakpoints_lines):
             else:
                 # Store pubmed id
                 if fields[0]:
-                    pubmed_id = {fields[0]}
-                    sequence_id = None
+                    pubmed_ids = {fields[0]}
+                    sequence_ids = None
+
+                    #print breakpoint
+                    #print resource_id_lookup[fields[1]]
+                    if not fields[1] in resource_id_lookup:
+                        print str(fields[1]) + " not in resource_id_lookup"
 
                     # If a pubmed id looks like an accession number then fix the ids
-                    if re.search("[A-Z]", str(pubmed_id)):
-                        pubmed_id, sequence_id = fix_pubmed_ids(str(pubmed_id.pop()))
-                    if pubmed_id:
-                        breakpoint_entry["references"]["pubmed"] = breakpoint_entry["references"]["pubmed"].union(pubmed_id)
-                    if sequence_id:
-                        breakpoint_entry["references"]["sequence"] = breakpoint_entry["references"]["sequence"].union(sequence_id)
+                    if re.search("[A-Z]", str(pubmed_ids)):
+                        pubmed_ids, sequence_ids = fix_pubmed_ids(str(pubmed_ids.pop()))
+                    if pubmed_ids:
+                        for pubmed_id in pubmed_ids:
+                            conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
+                                        (resource_id_lookup["PubMed"], str(breakpoint), str(pubmed_id)))
+                        breakpoint_entry["references"]["pubmed"] = breakpoint_entry["references"]["pubmed"].union(pubmed_ids)
+                    if sequence_ids:
+                        for sequence_id in sequence_ids:
+                            conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
+                                        (resource_id_lookup["GenBank"], str(breakpoint), str(sequence_id)))
+                        breakpoint_entry["references"]["sequence"] = breakpoint_entry["references"]["sequence"].union(sequence_ids)
 
                     breakpoint_entry["databases"].add(fields[1])
+
+
+                    cur.execute("SELECT * FROM Evidence WHERE RESOURCE_ID = ? AND FUSION_ID = ?",
+                                (resource_id_lookup[fields[1]], str(breakpoint)))
+
+                    if len(cur.fetchall()) == 0:
+                        conn.execute('INSERT INTO Evidence VALUES (?,?,NULL,NULL)',
+                                    (resource_id_lookup[fields[1]], str(breakpoint)))
 
                 # Store sequence id
                 if fields[2]:
                     breakpoint_entry["references"]["sequence"].add(fields[2])
                     breakpoint_entry["databases"].add(fields[3])
 
+                    conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
+                                (resource_id_lookup["GenBank"], str(breakpoint), str(fields[2])))
+
+                    cur.execute("SELECT * FROM Evidence WHERE RESOURCE_ID = ? AND FUSION_ID = ?",
+                                (resource_id_lookup[fields[3]], str(breakpoint)))
+                    if len(cur.fetchall()) == 0:
+                        conn.execute('INSERT INTO Evidence VALUES (?,?,NULL,NULL)',
+                                    (resource_id_lookup[fields[3]], str(breakpoint)))
+
+    conn.commit()
+    conn.close()
     return breakpoints
 
 
@@ -702,9 +761,111 @@ def print_gene_pair_entry(entry):
 #http://chitars.bioinfo.cnio.es/cgi-bin/breakpoints.pl?refdis=3&searchstr=<gene1_name>%20%26%20<gene2_name>
 
 
+def create_database(db_name):
+
+    conn = None
+
+    try:
+        conn = lite.connect(db_name)
+        #c = conn.cursor()
+
+        # Create Resource Table
+        conn.execute('''CREATE TABLE Resources
+           (RESOURCE_ID INTEGER PRIMARY KEY,
+           NAME         TEXT    NOT NULL,
+           RANK         INT    NOT NULL,
+           URL          TEXT,
+           CAN_QUERY    INT);''')
+
+        # Create Known Fusion Evidence table
+        conn.execute('''CREATE TABLE Evidence
+           (RESOURCE_ID    INT    NOT NULL,
+           FUSION_ID       TEXT   NOT NULL,
+           ACCESSION       TEXT,
+           SAMPLE_COUNT    INT);''')
+
+        # Create Known Fusions table
+        conn.execute('''CREATE TABLE Known_Fusions
+           (FUSION_ID     TEXT    NOT NULL,
+           GENE_ORDER     TEXT,
+           DISEASE        TEXT);''')
+
+        # Create Known Fusion Details
+        conn.execute('''CREATE TABLE Known_Fusions_Details
+           (FUSION_ID             TEXT  PRIMARY KEY NOT NULL,
+           FUSION_ORDER           INT,
+           GENE_NAME              TEXT,
+           GENOME_POS             INT,
+           EXON                   TEXT,
+           INTRON                 INT,
+           CYTOBAND               TEXT,
+           OMIM_ID                INT,
+           LOCUS_ID               INT,
+           ENSEMBL_TRANSCRIPT_ID  TEXT);''')
+
+        # Load Resources
+        resources = [
+            ('COSMIC', 1, 'http://cancer.sanger.ac.uk/cosmic/fusion/summary?id=', 1),
+            ('ChiTaRS', 2, 'http://chitars.bioinfo.cnio.es/cgi-bin/breakpoints.pl?'
+                              'refdis=3&searchstr=<gene1_name>%20%26%20<gene2_name>', 1),
+            ('TICdb', 3, 'http://www.unav.es/genetica/TICdb/', 1),
+            ('ChimerDB', 4, 'http://biome.ewha.ac.kr:8080/FusionGene/', 1),
+            ('dbCRID', 5, 'http://dbcrid.biolead.org/records.php', 1),
+            ('Mitelman', 6, 'http://cgap.nci.nih.gov/Chromosomes/Mitelman', 0),
+            ('PubMed', 7, 'http://www.ncbi.nlm.nih.gov/pubmed/<ids>?', 1),
+            ('GenBank', 8, 'http://www.ncbi.nlm.nih.gov/nuccore/<ids>?', 1),
+            ('OMIM', 9, 'http://www.omim.org/', 1),
+            ('NCBI_Genes', 10, 'http://www.ncbi.nlm.nih.gov/gene/<ids>?', 1),
+        ]
+
+        conn.executemany('INSERT INTO Resources VALUES (NULL,?,?,?,?)', resources)
+
+        conn.commit()
+
+    except lite.Error, e:
+
+        if conn:
+            conn.rollback()
+
+        print "Error %s:" % e.args[0]
+        sys.exit(1)
+
+    finally:
+
+        if conn:
+            conn.close()
+
+
 def main(args):
     opts = parse_cmdline_params(args[1:])
     merged_data = None
+
+    if opts.database_name:
+        if not os.path.isfile(opts.database_name):
+            create_database(opts.database_name)
+
+    conn = lite.connect(opts.database_name)
+
+    conn.row_factory = lite.Row
+    cur = conn.cursor()
+
+    cur.execute("SELECT NAME, RESOURCE_ID FROM Resources ORDER BY RANK")
+
+    rows = cur.fetchall()
+
+    print rows
+
+    cur.execute("SELECT * FROM Resources ORDER BY RANK")
+
+    for row in cur.fetchall():
+
+        print row['RANK'], row['RESOURCE_ID'], row['NAME'], row['URL']
+
+    cur.execute("SELECT * FROM Evidence")
+
+    for row in cur.fetchall():
+
+        print row
 
     if opts.cosmic_file:
 
@@ -718,28 +879,11 @@ def main(args):
         cosmic_gene_fusions = parse_cosmic_basic(cosmic_lines, transcript_coords)
         print "COSMIC processed"
 
-       # for gene_pair in cosmic_gene_fusions:
-       #     print gene_pair
-       #     for fusion_id in cosmic_gene_fusions[gene_pair]:
-       #         print "\t" + fusion_id
-       #         for transcript in cosmic_gene_fusions[gene_pair][fusion_id]["transcript_details"]:
-       #             print "\t\t" + str(transcript)
-       #         print "\t\t" + str(cosmic_gene_fusions[gene_pair][fusion_id]["pubmed"])
-
     if opts.chitars_file:
         chitars_lines = [f.rstrip() for f in opts.chitars_file]
-        chitars_breakpoints = parse_chitars_breakpoint(chitars_lines)
+        chitars_breakpoints = parse_chitars_breakpoint(chitars_lines, opts.database_name)
         #chitars_breakpoints = parse_chitars(chitars_lines)
         print "CHiTars processed"
-
-        #for gene_pair in chitars_breakpoints:
-        #    print gene_pair
-        #    for breakpoint in chitars_breakpoints[gene_pair]:
-        #        print "\t" + breakpoint
-        #        print "\t\t" + str(chitars_breakpoints[gene_pair][breakpoint]["references"]["pubmed"])
-        #        print "\t\t" + str(chitars_breakpoints[gene_pair][breakpoint]["references"]["sequence"])
-        #        print "\t\t" + str(chitars_breakpoints[gene_pair][breakpoint]["disease"])
-        #        print "\t\t" + str(chitars_breakpoints[gene_pair][breakpoint]["databases"])
 
     if opts.cosmic_file and opts.chitars_file:
         merged_data = merge_data(cosmic_gene_fusions, chitars_breakpoints)
