@@ -25,8 +25,9 @@ def main(args):
 
     index_list = []
     with open(args[1]) as infile:
-        for line in infile.readlines():
-            index_list.append(line.rstrip())
+        index_list = [f.rstrip() for f in infile]
+        #for line in infile.readlines():
+        #    index_list.append(line.rstrip())
         for i, index in enumerate(index_list):
             min_distance = 10
             total = 0

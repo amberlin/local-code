@@ -388,11 +388,22 @@ def parse_transcript_gtf(transcript_file):
 
 
 #Parse genes and PubMed reference from CosmicFusionExport_vXX.tsv file
-def parse_cosmic_basic(cosmic_lines, ensembl_transcript_details):
+def parse_cosmic_basic(cosmic_lines, ensembl_transcript_details, database):
     gene_list = my_dd()  # nested defaultdict
     transcript_details = {}
-    seen_fusion_list = {}
+    seen_fusions = set()
     seen_cosmic_ids = {}
+    seen_fusion_list = {}
+
+    conn = lite.connect(database)
+
+    # Store resources by Name to lookup the ID
+    conn.row_factory = lite.Row
+    cur = conn.cursor()
+    cur.execute("SELECT Name, ResourceID FROM Resources")
+    resource_id_lookup = {}
+    for row in cur.fetchall():
+        resource_id_lookup[row['Name']] = row['ResourceID']
 
     for line in cosmic_lines:
         fields = re.split("\t", line)
@@ -407,6 +418,103 @@ def parse_cosmic_basic(cosmic_lines, ensembl_transcript_details):
             else:
                 reference = "NA"
 
+            fusion_details = get_all_from_fusion(fusion_id)
+            #print fusion_id
+            #print fusion_details
+
+            gene_names = fusion_details['gene_names']
+            gene_pair = ":".join(gene_names)
+
+            conn.execute('INSERT INTO Known_Fusions VALUES (?,?,NULL)', (fusion_id, gene_pair))
+            conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
+                        (resource_id_lookup["PubMed"], str(fusion_id), str(reference)))
+            conn.execute('INSERT INTO Evidence VALUES (?,?,?,?)',
+                        (resource_id_lookup["COSMIC"], str(fusion_id), str(cosmic_id), 0))
+            conn.execute('UPDATE Evidence '
+                         'SET SampleCount = SampleCount + 1 '
+                         'WHERE ResourceID = ? AND FusionID = ? AND Accession = ?',
+                         (resource_id_lookup["COSMIC"], str(fusion_id), str(cosmic_id)))
+
+            if not fusion_id in seen_fusions:
+
+                fusion_exons = []
+                counter = 0
+                genes_involved = len(gene_names)
+
+                for gene_name, transcript, transcript_range in fusion_details['full_data']:
+                    if not transcript in transcript_details:
+
+                        # Query NCBI for transcripts details
+                        details, exon_details = lookup_transcript(transcript, gene_name, ensembl_transcript_details)
+
+                        # Save the transcript details so we don't have to query NCBI again
+                        transcript_details[transcript] = {}
+                        transcript_details[transcript]["details"] = details
+                        # 0: omim_id,
+                        # 1: locus_id,
+                        # 2: cytoband_location,
+                        # 3: gene_ref_accession,
+                        # 4: ensembl_id,
+                        # 5: gene_chromosome,
+                        # 6: gene_start_coord,
+                        # 7: gene_end_coord,
+                        # 8: gene_strand
+
+                        transcript_details[transcript]["exons"] = exon_details
+
+                    fusion_exons.append(transcript_details[transcript]["exons"])
+
+                    ### TODO Load information in to Gene Details Table here
+
+                exon_list = get_exons_involved(fusion_details['coords'],  fusion_exons)
+
+                print fusion_id
+                for gene_name, transcript, transcript_range in fusion_details['full_data']:
+
+                    details = transcript_details[transcript]["details"]
+
+                    if details[8] == "+" or details[8] == "plus":
+                        strand = 1
+                    else:
+                        strand = -1
+
+                    coords = transcript_range.split("_")
+
+                    if coords[0] == "?":
+                        coords = ["Null", "Null"]
+
+                    print gene_name
+
+                    ### TODO Pull exon information
+
+                    if counter == 0:  # Only load the 5' side of the fusion
+                        print "loading 5'"
+                        conn.execute('INSERT INTO Fusion_Part_Details VALUES '
+                                     '(?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,NULL)',
+                                    (fusion_id, counter, gene_name, details[5], details[6],
+                                     details[7], strand, transcript,
+                                     coords[0], coords[1], "exon", "exact", "intron"))
+
+                    elif counter == genes_involved - 1:  # Only load the 3' side of the fusion
+                        print "loading 3'"
+                        conn.execute('INSERT INTO Fusion_Part_Details VALUES '
+                                     '(?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,NULL)',
+                                    (fusion_id, counter, gene_name, details[5], details[6],
+                                     details[7], strand, transcript,
+                                     coords[0], coords[1], "exon", "exact", "intron"))
+                    else:
+                        print "Load both 3' and 5'"
+                        conn.execute('INSERT INTO Fusion_Part_Details VALUES '
+                                     '(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)',
+                                    (fusion_id, counter, gene_name, details[5], details[6],
+                                     details[7], strand, transcript,
+                                     coords[0], coords[1], "exon", "exact", "intron", "exon", "exact", "intron"))
+
+                    counter += 1
+
+        seen_fusions.add(fusion_id)
+
+        if 1 == 0:
             # Skip identical fusions with the same pubmed reference
             if not fusion_id+reference in seen_fusion_list:
 
@@ -417,12 +525,22 @@ def parse_cosmic_basic(cosmic_lines, ensembl_transcript_details):
                     #print "\n" + fusion_id + " : " + reference
                     gene_pair = ":".join(fusion_details['gene_names'])
 
-                    #Just pubmed id if we have already seen an identical fusion
+                    #Just store pubmed id if we have already seen an identical fusion
                     if gene_pair in gene_list and fusion_id in gene_list[gene_pair]:
                         gene_list[gene_pair][fusion_id]["references"]["pubmed"].append(reference)
+                        #conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
+                        #            (resource_id_lookup["PubMed"], str(fusion_id), str(reference)))
                         continue
 
-                    # Store fusion information
+                    # Store fusion information in database
+                    #conn.execute('INSERT INTO Known_Fusions VALUES (?,?,NULL)', (fusion_id, gene_pair))
+                    #conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
+                     #           (resource_id_lookup["PubMed"], str(fusion_id), str(reference)))
+                    #conn.execute('INSERT INTO Evidence VALUES (?,?,?,?)',
+                      #          (resource_id_lookup["COSMIC"], str(fusion_id), str(cosmic_id), 1))
+
+
+                    # Store fusion information in pickle structure
                     gene_list[gene_pair][fusion_id]["references"]["pubmed"] = [reference]
                     gene_list[gene_pair][fusion_id]["references"]["cosmic_id"] = [cosmic_id]
                     gene_list[gene_pair][fusion_id]["transcript_details"] = []
@@ -448,20 +566,32 @@ def parse_cosmic_basic(cosmic_lines, ensembl_transcript_details):
                         gene_list[gene_pair][fusion_id]["transcript_details"].append(transcript_details[transcript]["details"])
                         gene_list[gene_pair][fusion_id]["exon_details"].append(transcript_details[transcript]["exons"])
 
-                    gene_list[gene_pair][fusion_id]["exons-involved"] = \
-                        get_exons_involved(fusion_details['coords'], gene_list[gene_pair][fusion_id]["exon_details"])
+                    exon_list = get_exons_involved(fusion_details['coords'], gene_list[gene_pair][fusion_id]["exon_details"])
+
+                    gene_list[gene_pair][fusion_id]["exons-involved"] = exon_list
+
+                    #conn.execute('INSERT OR IGNORE INTO Evidence VALUES (?,?,?,?)',
+                    #            (resource_id_lookup["COSMIC"], str(fusion_id), str(cosmic_id), 0))
 
                     #print gene_list[gene_pair][fusion_id]
             else:
 
                 gene_list[":".join(get_genes(fusion_id))][fusion_id]["sample_count"] += 1
+                #conn.execute('UPDATE Evidence '
+                  #           'SET SAMPLE_COUNT = SAMPLE_COUNT + 1 '
+                  #           'WHERE RESOURCE_ID = ? AND FUSION_ID = ? AND ACCESSION = ?',
+                  #           (resource_id_lookup["COSMIC"], str(fusion_id), str(cosmic_id)))
 
             # Store new COSMIC id for a previously seen fusion
             if not cosmic_id in seen_cosmic_ids:
                 gene_pair = ":".join(get_genes(fusion_id))
                 gene_list[gene_pair][fusion_id]["references"]["cosmic_id"].append(cosmic_id)
+                #conn.execute('INSERT INTO Evidence VALUES (?,?,?,?)',
+                 #           (resource_id_lookup["COSMIC"], str(fusion_id), str(cosmic_id), 1))
                 seen_cosmic_ids[cosmic_id] = 1
 
+    conn.commit()
+    conn.close()
     return gene_list
 
 
@@ -531,7 +661,8 @@ def fix_pubmed_ids(ids):
     return set(list(pubmed_ids)), set(list(seq_ids))
 
 
-# Parse all data exported from ChiTars
+# Parse all data exported from ChiTars - manual collection from website
+# Should be replaced by parse_chitars_breakpoint
 def parse_chitars(lines):
     breakpoints = my_dd()  # nested defaultdict
     for line in lines:
@@ -567,14 +698,13 @@ def parse_chitars_breakpoint(breakpoints_lines, database):
 
     conn = lite.connect(database)
 
+    # Store resources by Name to lookup the ID
     conn.row_factory = lite.Row
     cur = conn.cursor()
-    cur.execute("SELECT NAME, RESOURCE_ID FROM Resources")
-
+    cur.execute("SELECT Name, ResourceID FROM Resources")
     resource_id_lookup = {}
     for row in cur.fetchall():
-        resource_id_lookup[row['NAME']] = row['RESOURCE_ID']
-
+        resource_id_lookup[row['Name']] = row['ResourceID']
 
     for line in breakpoints_lines:
         lines = line.split('\r')  # Handle conversion from excel tab-del format
@@ -596,20 +726,25 @@ def parse_chitars_breakpoint(breakpoints_lines, database):
                 breakpoint = fields[4]
                 gene_pair = fields[5]+":"+fields[6]
                 databases = set()
+
+                # Load into database tables
                 for db in (fields[1], fields[3]):
                     if db:
                         databases.add(db)
-                        conn.execute('INSERT INTO Evidence VALUES (?,?,NULL,NULL)',
-                                    (resource_id_lookup[db], str(breakpoint)))
+                        conn.execute('INSERT OR IGNORE INTO Evidence VALUES (?,?,?,NULL)',
+                                    (resource_id_lookup[db], str(breakpoint), "db"))
 
-                conn.execute('INSERT INTO Known_Fusions VALUES (?,?,?)', (breakpoint, gene_pair, fields[7]))
+                conn.execute('INSERT OR IGNORE INTO Known_Fusions VALUES (?,?,?)', (breakpoint, gene_pair, fields[7]))
                 if fields[0]:
-                    conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
+                    conn.execute('INSERT OR IGNORE INTO Evidence VALUES (?,?,?,NULL)',
                                 (resource_id_lookup["PubMed"], str(breakpoint), str(fields[0])))
                 if fields[2]:
-                    conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
+                    conn.execute('INSERT OR IGNORE INTO Evidence VALUES (?,?,?,NULL)',
                                 (resource_id_lookup["GenBank"], str(breakpoint), str(fields[2])))
 
+                # TODO Split breakpoint and load into Fusion Part Details with Gene Name
+
+                # Store in old pickle structure
                 breakpoint_entry = breakpoints[gene_pair][breakpoint]
                 breakpoint_entry["references"]["pubmed"] = {fields[0]}
                 breakpoint_entry["references"]["sequence"] = {fields[2]}
@@ -623,8 +758,6 @@ def parse_chitars_breakpoint(breakpoints_lines, database):
                     pubmed_ids = {fields[0]}
                     sequence_ids = None
 
-                    #print breakpoint
-                    #print resource_id_lookup[fields[1]]
                     if not fields[1] in resource_id_lookup:
                         print str(fields[1]) + " not in resource_id_lookup"
 
@@ -633,38 +766,29 @@ def parse_chitars_breakpoint(breakpoints_lines, database):
                         pubmed_ids, sequence_ids = fix_pubmed_ids(str(pubmed_ids.pop()))
                     if pubmed_ids:
                         for pubmed_id in pubmed_ids:
-                            conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
+                            conn.execute('INSERT OR IGNORE INTO Evidence VALUES (?,?,?,NULL)',
                                         (resource_id_lookup["PubMed"], str(breakpoint), str(pubmed_id)))
                         breakpoint_entry["references"]["pubmed"] = breakpoint_entry["references"]["pubmed"].union(pubmed_ids)
                     if sequence_ids:
                         for sequence_id in sequence_ids:
-                            conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
+                            conn.execute('INSERT OR IGNORE INTO Evidence VALUES (?,?,?,NULL)',
                                         (resource_id_lookup["GenBank"], str(breakpoint), str(sequence_id)))
                         breakpoint_entry["references"]["sequence"] = breakpoint_entry["references"]["sequence"].union(sequence_ids)
 
                     breakpoint_entry["databases"].add(fields[1])
 
-
-                    cur.execute("SELECT * FROM Evidence WHERE RESOURCE_ID = ? AND FUSION_ID = ?",
-                                (resource_id_lookup[fields[1]], str(breakpoint)))
-
-                    if len(cur.fetchall()) == 0:
-                        conn.execute('INSERT INTO Evidence VALUES (?,?,NULL,NULL)',
-                                    (resource_id_lookup[fields[1]], str(breakpoint)))
+                    conn.execute('INSERT OR IGNORE INTO Evidence VALUES (?,?,?,NULL)',
+                                (resource_id_lookup[fields[1]], str(breakpoint), "db"))
 
                 # Store sequence id
                 if fields[2]:
                     breakpoint_entry["references"]["sequence"].add(fields[2])
                     breakpoint_entry["databases"].add(fields[3])
 
-                    conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
+                    conn.execute('INSERT OR IGNORE INTO Evidence VALUES (?,?,?,NULL)',
                                 (resource_id_lookup["GenBank"], str(breakpoint), str(fields[2])))
-
-                    cur.execute("SELECT * FROM Evidence WHERE RESOURCE_ID = ? AND FUSION_ID = ?",
-                                (resource_id_lookup[fields[3]], str(breakpoint)))
-                    if len(cur.fetchall()) == 0:
-                        conn.execute('INSERT INTO Evidence VALUES (?,?,NULL,NULL)',
-                                    (resource_id_lookup[fields[3]], str(breakpoint)))
+                    conn.execute('INSERT OR IGNORE INTO Evidence VALUES (?,?,?,NULL)',
+                                (resource_id_lookup[fields[3]], str(breakpoint), "db"))
 
     conn.commit()
     conn.close()
@@ -771,43 +895,67 @@ def create_database(db_name):
 
         # Create Resource Table
         conn.execute('''CREATE TABLE Resources
-           (RESOURCE_ID INTEGER PRIMARY KEY,
-           NAME         TEXT    NOT NULL,
-           RANK         INT    NOT NULL,
-           URL          TEXT,
-           CAN_QUERY    INT);''')
+           (ResourceID   INTEGER   PRIMARY KEY,
+           Name         TEXT      NOT NULL,
+           Rank         INT       NOT NULL,
+           Url          TEXT,
+           CanQuery     INT
+           );''')
 
         # Create Known Fusion Evidence table
         conn.execute('''CREATE TABLE Evidence
-           (RESOURCE_ID    INT    NOT NULL,
-           FUSION_ID       TEXT   NOT NULL,
-           ACCESSION       TEXT,
-           SAMPLE_COUNT    INT);''')
+           (ResourceID     INT   NOT NULL,
+           FusionID       TEXT   NOT NULL,
+           Accession      TEXT,
+           SampleCount    INT,
+           PRIMARY KEY (ResourceID, FusionID, Accession) ON CONFLICT IGNORE
+           );''')
 
         # Create Known Fusions table
         conn.execute('''CREATE TABLE Known_Fusions
-           (FUSION_ID     TEXT    NOT NULL,
-           GENE_ORDER     TEXT,
-           DISEASE        TEXT);''')
+           (FusionID       TEXT  PRIMARY KEY  ON CONFLICT IGNORE  NOT NULL,
+           GeneOrder      TEXT,
+           Disease        TEXT
+           );''')
 
-        # Create Known Fusion Details
-        conn.execute('''CREATE TABLE Known_Fusions_Details
-           (FUSION_ID             TEXT  PRIMARY KEY NOT NULL,
-           FUSION_ORDER           INT,
-           GENE_NAME              TEXT,
-           GENOME_POS             INT,
-           EXON                   TEXT,
-           INTRON                 INT,
-           CYTOBAND               TEXT,
-           OMIM_ID                INT,
-           LOCUS_ID               INT,
-           ENSEMBL_TRANSCRIPT_ID  TEXT);''')
+        # Create Fusion Part Details table
+        conn.execute('''CREATE TABLE Fusion_Part_Details
+           (FusionID             TEXT  NOT NULL,
+           FusionOrder           INT   NOT NULL,
+           GeneName              TEXT,
+           Chromosome            INT,
+           GenomePosStart        INT,
+           GenomePosEnd          INT,
+           Strand                INT, -- Boolean
+           TranscriptID          TEXT,
+           TranscriptPosStart    INT,
+           TranscriptPosEnd      INT,
+           ExonFusion5prime      TEXT,
+           ExactBreakpoint5prime INT, --Boolean
+           IntronBases5prime     INT,
+           ExonFusion3prime      TEXT,
+           ExactBreakpoint3prime INT, --Boolean
+           IntronBases3prime     INT,
+           Cytoband              TEXT,
+           PRIMARY KEY (FusionID, FusionOrder) ON CONFLICT IGNORE
+           );''')
+
+        # Create Gene Details table
+        conn.execute('''CREATE TABLE Gene_Details
+            (GeneName            TEXT   PRIMARY KEY  ON CONFLICT IGNORE  NOT NULL,
+            Chromosome           INT,
+            GenomePosStart       INT,
+            GenomePosEnd         INT,
+            Cytoband             TEXT,
+            OmimID               INT,
+            LocusID              INT
+            );''')
 
         # Load Resources
         resources = [
             ('COSMIC', 1, 'http://cancer.sanger.ac.uk/cosmic/fusion/summary?id=', 1),
             ('ChiTaRS', 2, 'http://chitars.bioinfo.cnio.es/cgi-bin/breakpoints.pl?'
-                              'refdis=3&searchstr=<gene1_name>%20%26%20<gene2_name>', 1),
+                           'refdis=3&searchstr=<gene1_name>%20%26%20<gene2_name>', 1),
             ('TICdb', 3, 'http://www.unav.es/genetica/TICdb/', 1),
             ('ChimerDB', 4, 'http://biome.ewha.ac.kr:8080/FusionGene/', 1),
             ('dbCRID', 5, 'http://dbcrid.biolead.org/records.php', 1),
@@ -816,6 +964,7 @@ def create_database(db_name):
             ('GenBank', 8, 'http://www.ncbi.nlm.nih.gov/nuccore/<ids>?', 1),
             ('OMIM', 9, 'http://www.omim.org/', 1),
             ('NCBI_Genes', 10, 'http://www.ncbi.nlm.nih.gov/gene/<ids>?', 1),
+            ('Enzymatics', 11, 'http://archer.dev.enzymatics.com/', 0)
         ]
 
         conn.executemany('INSERT INTO Resources VALUES (NULL,?,?,?,?)', resources)
@@ -844,29 +993,6 @@ def main(args):
         if not os.path.isfile(opts.database_name):
             create_database(opts.database_name)
 
-    conn = lite.connect(opts.database_name)
-
-    conn.row_factory = lite.Row
-    cur = conn.cursor()
-
-    cur.execute("SELECT NAME, RESOURCE_ID FROM Resources ORDER BY RANK")
-
-    rows = cur.fetchall()
-
-    print rows
-
-    cur.execute("SELECT * FROM Resources ORDER BY RANK")
-
-    for row in cur.fetchall():
-
-        print row['RANK'], row['RESOURCE_ID'], row['NAME'], row['URL']
-
-    cur.execute("SELECT * FROM Evidence")
-
-    for row in cur.fetchall():
-
-        print row
-
     if opts.cosmic_file:
 
         transcript_coords = defaultdict
@@ -876,7 +1002,7 @@ def main(args):
             print "Loaded GTF file"
 
         cosmic_lines = [f.rstrip() for f in opts.cosmic_file][1:]
-        cosmic_gene_fusions = parse_cosmic_basic(cosmic_lines, transcript_coords)
+        cosmic_gene_fusions = parse_cosmic_basic(cosmic_lines, transcript_coords, opts.database_name)
         print "COSMIC processed"
 
     if opts.chitars_file:
@@ -907,8 +1033,25 @@ def main(args):
             print gene_pair
             print_gene_pair_entry(merged_data[gene_pair])
 
-    return 1
+    conn = lite.connect(opts.database_name)
 
+    conn.row_factory = lite.Row
+    cur = conn.cursor()
+
+    cur.execute("SELECT * FROM Resources ORDER BY Rank")
+    for row in cur.fetchall():
+        #print row['Rank'], row['ResourceID'], row['Name'], row['Url']
+        pass
+    cur.execute("SELECT * FROM Known_Fusions")
+    for row in cur.fetchall():
+        pass#print row
+
+    cur.execute("SELECT * FROM Evidence ORDER BY ResourceID, FusionID, Accession")
+
+    for row in cur.fetchall():
+        print row['ResourceID'], row['FusionID'], row['Accession'], row['SampleCount']
+
+    return 1
 
 if __name__ == "__main__":
     main(sys.argv)
