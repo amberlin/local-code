@@ -131,24 +131,7 @@ def get_genes(fusion):
     return __parse_fusion(fusion, "genes")
 
 
-# Parse genes from FusionExport File
-def parse_cosmic(cosmic_lines):
-    gene_list = []
-    seen_list = {}
-    for line in cosmic_lines:
-        fields = re.split("\t", line)
-        if len(fields) >= 8:
-            fusion = fields[7]
-            if not fusion in seen_list:
-                genes = get_genes(fusion)
-               # print genes
-                gene_list.append(genes)
-                seen_list[fusion] = 1
-
-    return gene_list
-
-
-def get_exons_involved(fusion_coordinates, exon_coordinates):
+def get_exons_involved_old(fusion_coordinates, exon_coordinates):
 
     if not len(fusion_coordinates) == len(exon_coordinates):
         print "WARN: Fusion and Exons coordinates are different lengths ... something is crossed up"
@@ -233,6 +216,75 @@ def get_exons_involved(fusion_coordinates, exon_coordinates):
     return exon_list
 
 
+def get_exons_involved(breakpoints, exon_coords):
+    """Looks up the exon closest to the breakpoint.  Can handle
+     insertions, deletions and breakpoints in introns.
+    """
+    exon_list = []
+    empty_list = ["Unknown", None, None, None]
+
+    for breakpoint_edge in breakpoints:
+            intron_bases = 0
+            indel = None
+
+            # If we don't have an exon coordinate list for the transcript
+            # All the ? should have already been converted into Null but just in case
+            # Ignore Null coordinates
+            if not exon_coords or breakpoint_edge == "?" or breakpoint_edge == "Null":
+                exon_list.append(empty_list)
+                continue
+
+            # Not sure how to handle the () yet - Skip them for now
+            if re.search("\(", breakpoint_edge):
+                exon_list.append(empty_list)
+                print "WARN: Coordinate w/ () is being skipped: " + breakpoint_edge
+                continue
+
+            # If the edge coordinate has a + or - then the break point is actually X bases in to the intron
+            if re.search("\+", breakpoint_edge):
+                breakpoint_edge, bp_into_intron = breakpoint_edge.split("+")
+                intron_bases = bp_into_intron
+
+            if re.search("\-", breakpoint_edge):
+                breakpoint_edge, bp_into_intron = breakpoint_edge.split("-")
+                intron_bases = "-" + bp_into_intron
+
+            # Handle if the coordinate has an insertion or deletion present
+            if re.search("ins|del", breakpoint_edge):
+                breakpoint_edge, indel = breakpoint_edge.split('_')
+
+            # If breakpoint edge coordinate has some weird text lets grab it and skip it for now
+            try:
+                breakpoint_edge = int(breakpoint_edge)
+            except ValueError:
+                print "WARN: Weird breakpoint is being skipped: " + breakpoint_edge
+                exon_list.append(empty_list)
+                continue
+
+            for j in range(len(exon_coords) - 1):
+
+                #Handle insertions
+                if breakpoint_edge > int(exon_coords[len(exon_coords) - 1]) and indel:
+                    exon_list.append([str(len(exon_coords)-1), 1, intron_bases, indel])
+                    break
+
+                #Handle offset
+                if breakpoint_edge > int(exon_coords[len(exon_coords) - 1]):
+                    exon_list.append([">"+str(len(exon_coords)-1), 0, intron_bases, indel])
+                    break
+
+                if int(exon_coords[j]) < breakpoint_edge <= int(exon_coords[j+1]):
+                    if int(exon_coords[j]) + 1 == breakpoint_edge or breakpoint_edge == int(exon_coords[j+1]):
+                        exact_match = 0
+                    else:
+                        exact_match = 1
+                    exon_list.append([str(j+1), exact_match, intron_bases, indel])
+                    #print "Exon : " + str(j+1)
+                    break
+
+    return exon_list
+
+
 # Parse the gene record returned by Entrez
 def parse_gene_record(record):
     omim_id = None
@@ -289,9 +341,9 @@ def run_search(query):
 
     # Warn if no records are found
     elif int(record["Count"]) == 0:
-        print "WARN: No genes found: " + str(record["WarningList"].get("OutputMessage")) + \
-              ": Search Attempted: " + str(record["QueryTranslation"])
         #print record
+        print "WARN: No genes found: " + \
+              ": Search Attempted: " + str(record["QueryTranslation"])
         return None
 
     # Warn if more than one record is found
@@ -389,11 +441,8 @@ def parse_transcript_gtf(transcript_file):
 
 #Parse genes and PubMed reference from CosmicFusionExport_vXX.tsv file
 def parse_cosmic_basic(cosmic_lines, ensembl_transcript_details, database):
-    gene_list = my_dd()  # nested defaultdict
     transcript_details = {}
     seen_fusions = set()
-    seen_cosmic_ids = {}
-    seen_fusion_list = {}
 
     conn = lite.connect(database)
 
@@ -416,18 +465,17 @@ def parse_cosmic_basic(cosmic_lines, ensembl_transcript_details, database):
             if len(fields) >= 12:
                 reference = fields[12]
             else:
-                reference = "NA"
+                reference = None
 
             fusion_details = get_all_from_fusion(fusion_id)
-            #print fusion_id
-            #print fusion_details
-
             gene_names = fusion_details['gene_names']
             gene_pair = ":".join(gene_names)
 
+            # Store Fusion and supporting evidence
             conn.execute('INSERT INTO Known_Fusions VALUES (?,?,NULL)', (fusion_id, gene_pair))
-            conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
-                        (resource_id_lookup["PubMed"], str(fusion_id), str(reference)))
+            if reference:
+                conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
+                            (resource_id_lookup["PubMed"], str(fusion_id), str(reference)))
             conn.execute('INSERT INTO Evidence VALUES (?,?,?,?)',
                         (resource_id_lookup["COSMIC"], str(fusion_id), str(cosmic_id), 0))
             conn.execute('UPDATE Evidence '
@@ -435,12 +483,13 @@ def parse_cosmic_basic(cosmic_lines, ensembl_transcript_details, database):
                          'WHERE ResourceID = ? AND FusionID = ? AND Accession = ?',
                          (resource_id_lookup["COSMIC"], str(fusion_id), str(cosmic_id)))
 
+            # Add the gene and exon information for new fusions
             if not fusion_id in seen_fusions:
 
-                fusion_exons = []
                 counter = 0
                 genes_involved = len(gene_names)
 
+                # Load all the gene and exon data
                 for gene_name, transcript, transcript_range in fusion_details['full_data']:
                     if not transcript in transcript_details:
 
@@ -462,14 +511,12 @@ def parse_cosmic_basic(cosmic_lines, ensembl_transcript_details, database):
 
                         transcript_details[transcript]["exons"] = exon_details
 
-                    fusion_exons.append(transcript_details[transcript]["exons"])
-
-                    ### TODO Load information in to Gene Details Table here
-
-                exon_list = get_exons_involved(fusion_details['coords'],  fusion_exons)
-
-                print fusion_id
-                for gene_name, transcript, transcript_range in fusion_details['full_data']:
+                    conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
+                                (resource_id_lookup["OMIM"], str(fusion_id),
+                                 str(transcript_details[transcript]["details"][0])))
+                    conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
+                                (resource_id_lookup["NCBI_Genes"], str(fusion_id),
+                                 str(transcript_details[transcript]["details"][1])))
 
                     details = transcript_details[transcript]["details"]
 
@@ -478,121 +525,72 @@ def parse_cosmic_basic(cosmic_lines, ensembl_transcript_details, database):
                     else:
                         strand = -1
 
+               #     if transcript_details[transcript]["details"][8] == "+" or \
+               #        transcript_details[transcript]["details"][8] == "plus":
+               #         strand = 1
+               #     else:
+               #         strand = -1
+
+                    conn.execute('INSERT INTO Gene_Details VALUES (?,?,?,?,?,?)',
+                                (gene_name, transcript_details[transcript]["details"][5],
+                                 transcript_details[transcript]["details"][6],
+                                 transcript_details[transcript]["details"][7],
+                                 strand,
+                                 str(transcript_details[transcript]["details"][2])
+                                 ))
+
+                #print fusion_id
+               # for gene_name, transcript, transcript_range in fusion_details['full_data']:
+
                     coords = transcript_range.split("_")
 
                     if coords[0] == "?":
                         coords = ["Null", "Null"]
 
-                    print gene_name
+                    # Check for _[ins|del]* or other wierdness
+                    if len(coords) == 3:
+                        coords[1] += "_" + coords[2]
+                        if not re.search("ins|del", coords[2]):
+                            print "WARN: New coordinate format being skipped: " + transcript_range
 
-                    ### TODO Pull exon information
+                    #if not transcript_details[transcript]["exons"]:
+                    #    print transcript
 
-                    if counter == 0:  # Only load the 5' side of the fusion
-                        print "loading 5'"
+                    # Only load the 5' side of the fusion
+                    if counter == 0:
+                        exons = get_exons_involved([coords[1]], transcript_details[transcript]["exons"])[0]
+
                         conn.execute('INSERT INTO Fusion_Part_Details VALUES '
                                      '(?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,NULL)',
                                     (fusion_id, counter, gene_name, details[5], details[6],
                                      details[7], strand, transcript,
-                                     coords[0], coords[1], "exon", "exact", "intron"))
+                                     coords[0], coords[1], exons[0], exons[1], exons[2]))
 
-                    elif counter == genes_involved - 1:  # Only load the 3' side of the fusion
-                        print "loading 3'"
+                    # Only load the 3' side of the fusion
+                    elif counter == genes_involved - 1:
+                        exons = get_exons_involved([coords[0]], transcript_details[transcript]["exons"])[0]
+
                         conn.execute('INSERT INTO Fusion_Part_Details VALUES '
                                      '(?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,NULL)',
                                     (fusion_id, counter, gene_name, details[5], details[6],
                                      details[7], strand, transcript,
-                                     coords[0], coords[1], "exon", "exact", "intron"))
+                                     coords[0], coords[1], exons[0], exons[1], exons[2]))
+                    # Load both sides of the fusion
                     else:
-                        print "Load both 3' and 5'"
+                        exons5, exons3 = get_exons_involved([coords[0], coords[1]],
+                                                            transcript_details[transcript]["exons"])
+
                         conn.execute('INSERT INTO Fusion_Part_Details VALUES '
                                      '(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)',
                                     (fusion_id, counter, gene_name, details[5], details[6],
-                                     details[7], strand, transcript,
-                                     coords[0], coords[1], "exon", "exact", "intron", "exon", "exact", "intron"))
-
+                                     details[7], strand, transcript, coords[0], coords[1],
+                                     exons5[0], exons5[1], exons5[2], exons3[0], exons3[1], exons3[2]))
                     counter += 1
 
-        seen_fusions.add(fusion_id)
-
-        if 1 == 0:
-            # Skip identical fusions with the same pubmed reference
-            if not fusion_id+reference in seen_fusion_list:
-
-                seen_fusion_list[fusion_id+reference] = 1
-                fusion_details = get_all_from_fusion(fusion_id)
-
-                if fusion_details:
-                    #print "\n" + fusion_id + " : " + reference
-                    gene_pair = ":".join(fusion_details['gene_names'])
-
-                    #Just store pubmed id if we have already seen an identical fusion
-                    if gene_pair in gene_list and fusion_id in gene_list[gene_pair]:
-                        gene_list[gene_pair][fusion_id]["references"]["pubmed"].append(reference)
-                        #conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
-                        #            (resource_id_lookup["PubMed"], str(fusion_id), str(reference)))
-                        continue
-
-                    # Store fusion information in database
-                    #conn.execute('INSERT INTO Known_Fusions VALUES (?,?,NULL)', (fusion_id, gene_pair))
-                    #conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
-                     #           (resource_id_lookup["PubMed"], str(fusion_id), str(reference)))
-                    #conn.execute('INSERT INTO Evidence VALUES (?,?,?,?)',
-                      #          (resource_id_lookup["COSMIC"], str(fusion_id), str(cosmic_id), 1))
-
-
-                    # Store fusion information in pickle structure
-                    gene_list[gene_pair][fusion_id]["references"]["pubmed"] = [reference]
-                    gene_list[gene_pair][fusion_id]["references"]["cosmic_id"] = [cosmic_id]
-                    gene_list[gene_pair][fusion_id]["transcript_details"] = []
-                    gene_list[gene_pair][fusion_id]["exon_details"] = []
-                    gene_list[gene_pair][fusion_id]["exons-involved"] = []
-                    gene_list[gene_pair][fusion_id]["sample_count"] = 1
-
-                    seen_cosmic_ids[cosmic_id] = 1
-
-                    # Store information for each transcript in the fusion
-                    for gene_name, transcript in fusion_details['pairs']:
-                        if not transcript in transcript_details:
-
-                            # Query NCBI for transcripts details
-                            details, exon_details = lookup_transcript(transcript, gene_name, ensembl_transcript_details)
-
-                            # Save the transcript details so we don't have to query NCBI again
-                            transcript_details[transcript] = {}
-                            transcript_details[transcript]["details"] = details
-                            transcript_details[transcript]["exons"] = exon_details
-
-                        #print "\t" + transcript + ": " + str(transcript_details[transcript])
-                        gene_list[gene_pair][fusion_id]["transcript_details"].append(transcript_details[transcript]["details"])
-                        gene_list[gene_pair][fusion_id]["exon_details"].append(transcript_details[transcript]["exons"])
-
-                    exon_list = get_exons_involved(fusion_details['coords'], gene_list[gene_pair][fusion_id]["exon_details"])
-
-                    gene_list[gene_pair][fusion_id]["exons-involved"] = exon_list
-
-                    #conn.execute('INSERT OR IGNORE INTO Evidence VALUES (?,?,?,?)',
-                    #            (resource_id_lookup["COSMIC"], str(fusion_id), str(cosmic_id), 0))
-
-                    #print gene_list[gene_pair][fusion_id]
-            else:
-
-                gene_list[":".join(get_genes(fusion_id))][fusion_id]["sample_count"] += 1
-                #conn.execute('UPDATE Evidence '
-                  #           'SET SAMPLE_COUNT = SAMPLE_COUNT + 1 '
-                  #           'WHERE RESOURCE_ID = ? AND FUSION_ID = ? AND ACCESSION = ?',
-                  #           (resource_id_lookup["COSMIC"], str(fusion_id), str(cosmic_id)))
-
-            # Store new COSMIC id for a previously seen fusion
-            if not cosmic_id in seen_cosmic_ids:
-                gene_pair = ":".join(get_genes(fusion_id))
-                gene_list[gene_pair][fusion_id]["references"]["cosmic_id"].append(cosmic_id)
-                #conn.execute('INSERT INTO Evidence VALUES (?,?,?,?)',
-                 #           (resource_id_lookup["COSMIC"], str(fusion_id), str(cosmic_id), 1))
-                seen_cosmic_ids[cosmic_id] = 1
+            seen_fusions.add(fusion_id)
 
     conn.commit()
     conn.close()
-    return gene_list
 
 
 # Merge COSMIC and ChiTars data structures
@@ -710,6 +708,8 @@ def parse_chitars_breakpoint(breakpoints_lines, database):
         lines = line.split('\r')  # Handle conversion from excel tab-del format
 
         for split_line in lines[1:]:  # Skip header line
+            if re.search("Sep", split_line):
+                print split_line
             fields = split_line.split('\t')
             # 0 : Pubmed Reference id
             # 1 : Database providing pubmed id
@@ -731,18 +731,51 @@ def parse_chitars_breakpoint(breakpoints_lines, database):
                 for db in (fields[1], fields[3]):
                     if db:
                         databases.add(db)
-                        conn.execute('INSERT OR IGNORE INTO Evidence VALUES (?,?,?,NULL)',
+                        conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
                                     (resource_id_lookup[db], str(breakpoint), "db"))
 
-                conn.execute('INSERT OR IGNORE INTO Known_Fusions VALUES (?,?,?)', (breakpoint, gene_pair, fields[7]))
+                conn.execute('INSERT INTO Known_Fusions VALUES (?,?,?)', (breakpoint, gene_pair, fields[7]))
                 if fields[0]:
-                    conn.execute('INSERT OR IGNORE INTO Evidence VALUES (?,?,?,NULL)',
+                    conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
                                 (resource_id_lookup["PubMed"], str(breakpoint), str(fields[0])))
                 if fields[2]:
-                    conn.execute('INSERT OR IGNORE INTO Evidence VALUES (?,?,?,NULL)',
+                    conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
                                 (resource_id_lookup["GenBank"], str(breakpoint), str(fields[2])))
 
-                # TODO Split breakpoint and load into Fusion Part Details with Gene Name
+                # TODO Split breakpoint and load cytoband into Fusion Part Details with Gene Name
+
+                # If Gene is not in the Gene_Details table lookup info from NCBI and populate
+                for gene_name in gene_pair.split(":"):
+                    print gene_name
+                    cursor = conn.cursor()
+                    cursor.execute('SELECT rowid FROM Gene_Details WHERE GeneName = ?', (gene_name,))
+                    data = cursor.fetchone()
+                    if not data:
+                        gene_details = lookup_by_gene(gene_name)
+                            # 0: omim_id,
+                            # 1: locus_id,
+                            # 2: cytoband_location,
+                            # 3: gene_ref_accession,
+                            # 4: ensembl_id,
+                            # 5: gene_chromosome,
+                            # 6: gene_start_coord,
+                            # 7: gene_end_coord,
+                            # 8: gene_strand
+                        if not gene_details:
+                            continue
+
+                        if gene_details[8] == "+" or gene_details[8] == "plus":
+                            strand = 1
+                        else:
+                            strand = -1
+
+                        conn.execute('INSERT INTO Gene_Details VALUES (?,?,?,?,?,?)',
+                                    (gene_name, gene_details[5], gene_details[6],
+                                     gene_details[7], strand, str(gene_details[2])))
+                        conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
+                                    (resource_id_lookup["OMIM"], str(breakpoint), str(gene_details[0])))
+                        conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
+                                    (resource_id_lookup["NCBI_Genes"], str(breakpoint), str(gene_details[1])))
 
                 # Store in old pickle structure
                 breakpoint_entry = breakpoints[gene_pair][breakpoint]
@@ -766,18 +799,18 @@ def parse_chitars_breakpoint(breakpoints_lines, database):
                         pubmed_ids, sequence_ids = fix_pubmed_ids(str(pubmed_ids.pop()))
                     if pubmed_ids:
                         for pubmed_id in pubmed_ids:
-                            conn.execute('INSERT OR IGNORE INTO Evidence VALUES (?,?,?,NULL)',
+                            conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
                                         (resource_id_lookup["PubMed"], str(breakpoint), str(pubmed_id)))
                         breakpoint_entry["references"]["pubmed"] = breakpoint_entry["references"]["pubmed"].union(pubmed_ids)
                     if sequence_ids:
                         for sequence_id in sequence_ids:
-                            conn.execute('INSERT OR IGNORE INTO Evidence VALUES (?,?,?,NULL)',
+                            conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
                                         (resource_id_lookup["GenBank"], str(breakpoint), str(sequence_id)))
                         breakpoint_entry["references"]["sequence"] = breakpoint_entry["references"]["sequence"].union(sequence_ids)
 
                     breakpoint_entry["databases"].add(fields[1])
 
-                    conn.execute('INSERT OR IGNORE INTO Evidence VALUES (?,?,?,NULL)',
+                    conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
                                 (resource_id_lookup[fields[1]], str(breakpoint), "db"))
 
                 # Store sequence id
@@ -785,9 +818,9 @@ def parse_chitars_breakpoint(breakpoints_lines, database):
                     breakpoint_entry["references"]["sequence"].add(fields[2])
                     breakpoint_entry["databases"].add(fields[3])
 
-                    conn.execute('INSERT OR IGNORE INTO Evidence VALUES (?,?,?,NULL)',
+                    conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
                                 (resource_id_lookup["GenBank"], str(breakpoint), str(fields[2])))
-                    conn.execute('INSERT OR IGNORE INTO Evidence VALUES (?,?,?,NULL)',
+                    conn.execute('INSERT INTO Evidence VALUES (?,?,?,NULL)',
                                 (resource_id_lookup[fields[3]], str(breakpoint), "db"))
 
     conn.commit()
@@ -923,19 +956,19 @@ def create_database(db_name):
            (FusionID             TEXT  NOT NULL,
            FusionOrder           INT   NOT NULL,
            GeneName              TEXT,
-           Chromosome            INT,
+           Chromosome            TEXT, --Don't forget about X and Y
            GenomePosStart        INT,
            GenomePosEnd          INT,
-           Strand                INT, -- Boolean
+           Strand                INT, -- +1 or -1
            TranscriptID          TEXT,
            TranscriptPosStart    INT,
            TranscriptPosEnd      INT,
-           ExonFusion5prime      TEXT,
-           ExactBreakpoint5prime INT, --Boolean
-           IntronBases5prime     INT,
-           ExonFusion3prime      TEXT,
-           ExactBreakpoint3prime INT, --Boolean
-           IntronBases3prime     INT,
+           ExonFusion5prime      TEXT, --Closest exon to the 5' side of the fusion
+           ExactBreakpoint5prime INT,  --Boolean
+           IntronBases5prime     INT,  --Bases into the intron if breakpoint is not exonic
+           ExonFusion3prime      TEXT, --Closest exon to the 3' side of the fusion
+           ExactBreakpoint3prime INT,  --Boolean
+           IntronBases3prime     INT,  --Bases into the intron if breakpoint is not exonic
            Cytoband              TEXT,
            PRIMARY KEY (FusionID, FusionOrder) ON CONFLICT IGNORE
            );''')
@@ -943,12 +976,11 @@ def create_database(db_name):
         # Create Gene Details table
         conn.execute('''CREATE TABLE Gene_Details
             (GeneName            TEXT   PRIMARY KEY  ON CONFLICT IGNORE  NOT NULL,
-            Chromosome           INT,
+            Chromosome           TEXT, -- Don't forget about X and Y
             GenomePosStart       INT,
             GenomePosEnd         INT,
-            Cytoband             TEXT,
-            OmimID               INT,
-            LocusID              INT
+            Strand               INT,  -- +1 or -1
+            Cytoband             TEXT
             );''')
 
         # Load Resources
@@ -1002,7 +1034,7 @@ def main(args):
             print "Loaded GTF file"
 
         cosmic_lines = [f.rstrip() for f in opts.cosmic_file][1:]
-        cosmic_gene_fusions = parse_cosmic_basic(cosmic_lines, transcript_coords, opts.database_name)
+        parse_cosmic_basic(cosmic_lines, transcript_coords, opts.database_name)
         print "COSMIC processed"
 
     if opts.chitars_file:
@@ -1011,15 +1043,15 @@ def main(args):
         #chitars_breakpoints = parse_chitars(chitars_lines)
         print "CHiTars processed"
 
-    if opts.cosmic_file and opts.chitars_file:
-        merged_data = merge_data(cosmic_gene_fusions, chitars_breakpoints)
-        print "Merged"
+   # if opts.cosmic_file and opts.chitars_file:
+   #     merged_data = merge_data(cosmic_gene_fusions, chitars_breakpoints)
+   #     print "Merged"
 
-        pickle.dump(merged_data, open("merged_fusion_data.pickle", "wb"))
-        print "Pickled"
+    #    pickle.dump(merged_data, open("merged_fusion_data.pickle", "wb"))
+    #    print "Pickled"
 
-    if opts.pickled_data:
-        merged_data = pickle.load(open(opts.pickled_data, "rb"))
+    #if opts.pickled_data:
+    #    merged_data = pickle.load(open(opts.pickled_data, "rb"))
 
     if opts.test_data:
         test_lines = [f.rstrip() for f in opts.test_data]
@@ -1046,10 +1078,17 @@ def main(args):
     for row in cur.fetchall():
         pass#print row
 
-    cur.execute("SELECT * FROM Evidence ORDER BY ResourceID, FusionID, Accession")
-
+    cur.execute("SELECT * FROM Gene_Details")
     for row in cur.fetchall():
-        print row['ResourceID'], row['FusionID'], row['Accession'], row['SampleCount']
+        print row
+
+    cur.execute("SELECT * FROM Fusion_Part_Details ORDER BY FusionID, FusionOrder")
+    for row in cur.fetchall():
+        print row
+
+    cur.execute("SELECT * FROM Evidence ORDER BY ResourceID, FusionID, Accession")
+    for row in cur.fetchall():
+        pass#print row['ResourceID'], row['FusionID'], row['Accession'], row['SampleCount']
 
     return 1
 
